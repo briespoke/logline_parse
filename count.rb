@@ -60,7 +60,7 @@ module CountVonCount
 
             hash
           end
-          hash_key = JSON.generate(hash)
+          hash_key = Marshal::dump(hash)
 
           totals[hash_key] ||= {hash: hash, total: 0}
           totals[hash_key][:total] += 1
