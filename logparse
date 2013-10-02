@@ -1,0 +1,378 @@
+#!/usr/bin/perl
+# ( grep { $_ eq $val} @array )
+use strict;
+use warnings;
+use Time::Local; #'timelocal_nocheck';
+use HTTP::BrowserDetect;
+use URI::Escape;
+use Cwd 'abs_path';
+use File::Spec;
+
+my @cl_args;
+
+my $timeshift;
+my $ignoreDatestamp = 1;
+my $ignoreTimestamp = 1;
+my $ignoreCase = 1;
+my $ignoreReferrer = 1;
+my $ignoreIp = 1;
+my $ignoreBrowser = 1;
+my $findOrigin=0;
+my $findRealReferrer=0;
+my $findShitlist=0;
+
+my $sitelist_reg = construct_sitelist_reg();
+
+#This is how each logline line will be split up.
+my $reg = qr/^\[(.{2}).(.{3}).(.{4}).(.{2}).(.{2}).(.{2}).(.)(.{2})..\] "\/placements\/(\d+)\?([^"]*)" "([^"]*)" "([^"]*)" "([^"]*)" ([^ ]+)$/;
+my @monthlist = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec); 
+my @curTime = localtime;
+my $lastMonth=(($curTime[4]-1) % 12 )+1;
+my ($day,$month,$year,$hour,$min,$sec,$offsetdir,$offset,$placement,$tags,$spongekey,$referrer,$browser,$ip);
+my $browserDetector = new HTTP::BrowserDetect("null");
+my %iphash;
+
+
+### We'll need to convert monthnames to monthnumbers pretty frequently via a search of the
+### @monthlist parameters. To speed this up,
+### we adjust the monthname array so that the most recent months are in the first few
+### indices.
+
+if ($lastMonth>1){
+  @monthlist = @monthlist[$lastMonth-1..11,0...$lastMonth-2];
+}
+
+## We have to choose one method or another.
+
+my $arg;
+#We're going to scan through the arguments twice. The first time we'll look
+#for parameters whose presence justifies us setting global variables:
+foreach(@ARGV[1..scalar(@ARGV)-1]){
+  $arg = $_;
+  if ($arg =~ /-+PST$/){
+    $timeshift=-7;
+    $ignoreTimestamp = 0;
+  } elsif ($arg =~ /-+UTC$/){
+    $timeshift=0;
+    $ignoreTimestamp = 0;
+  } elsif ($arg =~ /-+EST$/){
+    $timeshift=-4;
+    $ignoreTimestamp = 0;
+  } elsif ($arg =~ /-+CST$/){
+    $timeshift=1;
+    $ignoreTimestamp = 0;
+  } elsif ($arg =~ /-+(no)?case/){
+    $ignoreCase=0;
+  } elsif ($arg =~ /-+browser_/){
+    $ignoreBrowser=0;
+  } elsif ( ($arg =~ /-+(date|time)stamp=/) || ($arg =~ /-+hour/) || ($arg =~/-+min/) || ($arg =~ /-+sec/)){
+    $ignoreDatestamp=0;
+  } elsif ($arg =~ /-+referrer(_host)?=/){
+    $ignoreReferrer=0;
+  } elsif ( ($arg =~ /-+ip/) || ($arg =~ /-+external_ip/) || ($arg =~ /-+realip/) ){
+    $ignoreIp=0;
+  } elsif ($arg =~ /-+origin=/){
+    $findOrigin=1;
+    
+  } elsif ($arg =~ /-+realreferrer=/){
+    $ignoreReferrer=0;
+    $findRealReferrer=1;
+  } 
+  if($arg =~/-+dst$/){
+    $timeshift+=1;
+  }
+}
+
+##The second time through, we'll store anything that looks like a --key=value pair.
+my ($p1,$p2);
+foreach(@ARGV[1..scalar(@ARGV)-1]){
+  ($p1,$p2) = $_ =~ /^-+(.+)=(.+)$/;
+  $p2 || next;
+  if($ignoreCase){
+    $p1 = lc($p1);
+    $p2 = lc($p2);
+  }
+  if ($p2){
+    push(@cl_args,[$p1,[split(/,/,$p2)]]);
+  }
+}
+#These variables are going to be reused a lot, so let's not recreate them every line
+my ($a,$b);
+my $dt;
+
+#Start parsing that log file!
+
+
+open FIN, "< $ARGV[0]" or die  "Input file $ARGV[0] not found\n";
+
+while(<FIN>){
+  chomp;
+  my %spongetag;
+
+  #split the line up according the regular expression set outside of this loop.
+  ($day,$month,$year,$hour,$min,$sec,$offsetdir,$offset,$placement,$tags,$spongekey,$referrer,$browser,$ip) = $_ =~ /$reg/;
+  if ( !($ignoreIp || $ip) | !$tags ) {
+    print STDERR "invalid line:".$_."\n";
+    next;
+  }
+  ##We take each parameter of the url in $tag and store them as --key=value pairs
+  my @tags = split(/&/,$tags);
+  while(@tags){
+    my ($a,$b) = split(/=/,shift(@tags));
+    $b = $b || "NULL";
+    if($ignoreCase){
+	    $a =~ s/%5F/_/g;
+      $b =~ s/%5F/_/g;
+      $a = lc(uri_unescape($a));
+      $b = lc(uri_unescape($b));
+    }
+    $spongetag{$a}=$b;
+  }  
+  $spongetag{'tag'}=$tags;
+  $spongetag{'spongekey'}=$spongekey;
+  $spongetag{'placement'}=$placement;
+  $spongetag{'spongetag'}=$tags;
+  $spongetag{'offset'}=$offset;
+  $spongetag{'realip'} = ($spongetag{'external_ip_address'} || $ip); 
+  ($spongetag{'external_ip3_address'}) = (($spongetag{'external_ip_address'} || "") =~ /(.*)\.[0-9]+$/);
+
+  ##We now take the chunks of the logfile and store them in the %spongetag hash.
+  ##A lot of these require some parsing and adjustments, and some of them
+  ##(especially date adjustments and browser checking) are VERY slow. So we
+  ##only do them if we absolutely have to.
+  if (!$ignoreDatestamp){
+	#=begin time manipulations    
+    my ($monthnum) = (grep { $monthlist[$_] eq $month } 0..$#monthlist);
+	  $monthnum  = (($monthnum + $lastMonth - 1) % 12)+1; 
+	  $month = $monthnum < 10 ? "0" + $monthnum : $monthnum;
+	  #record this before we start jacking with it
+	  
+	#=begin timezone conversion stuff  
+	  $offset = $offsetdir eq '-' ? $offset * -1 : $offset;
+	  if (!$ignoreTimestamp && !($offset eq $timeshift)){
+		  $dt = timelocal($sec,$min,$hour,$day,$month-1,$year) + ($timeshift-$offset)*3600;
+		  ($sec,$min,$hour,$day,$month,$year) = localtime($dt);
+		  $year+=1900;
+      $month+=1;
+	  }
+    $month = $month < 10 ? "0" + ($month) : ($month);
+	#=end timezone conversion stuff
+	  $spongetag{'day'}= $day = "0" x ( 2 - length( $day ) ) . $day;
+    if ($monthnum==0){
+      $spongetag{'month'} = $month = "12";  
+    } else {
+	    $spongetag{'month'} = $month = "0" x ( 2 - length( $month ) ) . $month;
+	  }
+    $spongetag{'hour'} = "0" x ( 2 - length( $hour ) ) .  $hour;
+	  $spongetag{'min'} = "0" x ( 2 - length( $min ) ) .  $min;
+	  $spongetag{'sec'} = "0" x ( 2 - length( $sec ) ) .  $sec;
+	#=end time manipulation stuff
+	  $spongetag{'datestamp'}=$year."-".$month."-".$day;
+	  $spongetag{'timestamp'}=$spongetag{'hour'}.":".$spongetag{'min'}.":".$spongetag{'sec'};
+  }	
+  
+  if(!$ignoreReferrer){
+	  ($spongetag{'referrer_host'}) = $referrer =~ /^http:\/\/([^\/]+)\//;
+	  $spongetag{'referrer'}=$referrer;
+  }
+  if(!$ignoreIp){
+	  $spongetag{'ip'}=$ip;
+    ($spongetag{'ip3'}) = $ip =~ /(.*)\.[0-9]+$/;
+    ($spongetag{'ip2'}) = $ip =~ /(.*)\.[0-9]+\.[0-9]+$/;
+    ($spongetag{'realip3'}) = $spongetag{'realip'} =~ /(.*)\.[0-9]+$/;
+    ($spongetag{'realip2'}) = $spongetag{'realip'} =~ /(.*)\.[0-9]+\.[0-9]+$/;
+  }	
+  if(!$ignoreBrowser){
+	$browserDetector->user_agent($browser);
+	$spongetag{'browser_name'} = ($browserDetector->browser_string() || "other")." ".($browserDetector->device_name() || "");
+	$spongetag{'browser_ver'} = ($browserDetector->version() || "other");
+  #$browserDetector->major();
+  $spongetag{'browser_os'} = ($browserDetector->os_string() || "other");
+  $spongetag{'browser_isRobot'} = ($browserDetector->robot() || "other");
+
+  }
+  ($spongetag{'browser'}) =$browser; 
+  if($findOrigin){
+     $spongetag{'origin'} = find_origin(\%spongetag);
+  }
+
+  if($findRealReferrer){
+    $spongetag{'realreferrer'}=find_real_referrer($referrer,1);
+  }
+
+
+  #We only want our report to include log events that match at least one of the parameters
+  #we've specified in our command line arguments. So we call the "isExcluded" method.
+     
+  if (!isExcluded(\%spongetag,\@cl_args)){
+    print $spongetag{$cl_args[0][0]} || "";
+    foreach $arg (@cl_args[1..scalar(@cl_args)-1]){
+       print "\t".($spongetag{${$arg}[0]} || "");
+    }
+    print "\n";
+  } 
+} 
+
+
+## This method is going to be called once per line. It compares the command-line arguments
+## stored in cl_args to the data gleaned from the log to see if the line should be
+## filtered out.
+sub isExcluded{
+   my $spongetag = shift;
+   my $cl_args = shift;
+  #if the spongetag is missing a parameter that is specified in cl_args,
+  #then the "filter" method will exclude that line while the "awk" method
+  #will treat the lines as if it has the parameter set to "".
+   foreach $arg (@{$cl_args}){
+     if (!exists(${$spongetag}{${$arg}[0]})){
+       return 2 if !(${$arg}[1][0] eq "*");
+     }
+     return 1 if !((${$arg}[1][0] eq "*") || ( grep { $_ eq ${$spongetag}{${$arg}[0]}} @{${$arg}[1]} ));
+    }
+  return 0;
+}
+
+sub urldecode {
+    my $s = shift;
+    $s =~ s/\%([A-Fa-f0-9]{2})/pack('C', hex($1))/seg;
+    $s =~ s/\+/ /g;
+    return $s;
+}
+
+
+sub find_real_referrer{
+  my $referrer = shift;
+  my $depth = shift;
+  if ($depth > 6){
+    return $referrer;
+  }
+  if($referrer =~ /^http:\/\/tag.admeld.com\/imp.*?url=([^&]+)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif($referrer =~ /^http:\/\/x2.vindicosuite.com\/serve.*;u=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif($referrer =~ /^http:\/\/afe2?.specificclick.net\/serve.*;(r|pasmc|u)=(.*)/){
+    return find_real_referrer(uri_unescape($2),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/[^\/]+adnxs.com\/.*referrer=([^&]+)(&|\?)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/a.rfihub.com\/sed.*&rs=([^&]+)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/a.rfihub.com\/sed.*&pf=([^&]+)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/a.rfihub.com\/sed.*&pe=([^&]+)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/apr.lijit.com\/.*&od=([^&]+)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ad.*.doubleclick.net\/.*;click0?=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ad.*.doubleclick.net\/.*\/adi\/([^\/]+)\//){
+    return "doubleclick eid:".$1;   
+  } elsif ($referrer =~ /^http:\/\/ad.[a-z].doubleclick.net\/.*;dc_ref=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/bh.contextweb.com\/bh\/ct\?q=[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~([^~]+)~/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ad.yieldmanager.com\/.*,,(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/googleads.g.doubleclick.net\/.*&url=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/googleads.g.doubleclick.net\/.*&loc=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ads.undertone.com\/.*&td_s=([^&]*)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ads.undertone.com\/.*oadest=(.*)\..*/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/clickserv.sitescout.com\/./){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/eu2.projectsunblock.com\/.*&u=([^&]+)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/network.realmedia.com\/RealMedia\/ads\/click_lx.ads\/([^\/]+)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  }  
+  if($referrer =~ /(http:\/\/?[^\/]+\/)/){
+    return $1;
+  } else {
+    return $referrer;
+  }
+}
+
+
+sub construct_sitelist_reg{
+  my $retval;
+  open FIN, abs_path("sitelist.txt") or die $!;
+  $retval = <FIN>;
+  chomp($retval);
+  while(<FIN>){
+    chomp;
+    $retval .= "|".$_;
+  }
+  close FIN;
+  return qr/$retval/;
+}
+
+sub construct_iplist_hash{
+  my %retval;
+  open FIN2, abs_path("iplist.txt") or die $!;
+  while(<FIN2>){
+    chomp;
+    $retval{$_} = '1';
+  }
+  close FIN2;
+  return %retval;
+}
+
+sub find_origin{
+    my $hashref=shift;
+    my %spongetag = %{$hashref};
+    my $realIP = $spongetag{'realip'};
+    
+     if($realIP =~ /173.247.207.3/){ #other candidates: 72.43.111.90,
+        return("Test page (Sponge SF by IP)");
+     } elsif (($realIP =~ /^72.43./) && ($referrer =~ /^http:\/\/cdn.statics.live.spongecell.com/)){
+        return("Test page (Sponge NY by IP)");
+     } elsif (($spongetag{'external_placement_id'} || "") eq "testing"){
+        return("Test page (Sponge by epid)");
+     } elsif ($referrer =~ /^http:\/\/exchange.pulsepoint.com/){
+        return("Test page (Pulsepoint)");
+     } elsif($browser =~ /^Mozilla\/4.0$/){
+        return("blacklisted");
+     } elsif($browser =~ /360Spider/){
+        return("China: 360Spider");
+     } elsif($realIP =~ /^157.55/ || $realIP =~ /^157.56/ || $realIP =~ /^65.55/){
+        return("MSN Bot");
+     } elsif ($browser =~ /baidu.com/){
+        return("Baidu bot");
+     } elsif($browser =~ /^Apache-HttpClient/){
+        return("Apache-HttpClient bot");
+     } elsif($realIP =~ /^217.69.134.79/){
+        return("Mail.RU bot");
+     } elsif($browser =~ /www.majestic12.co.uk/){
+        return("http://www.majestic12.co.uk/bot.php");
+     } elsif($browser =~ /proximic;/){
+        return("http://www.proximic.com/info/spider.php");  
+     } elsif($realIP =~ /^66.249.76/){
+        return("Google Crawler");
+     } elsif($browser =~ /Google Web Preview/){
+        return("Google Web Preview");
+     } elsif ($browser=~/Ezooms/){
+        return("Ezooms bot");
+     } elsif ($browser=~/Googlebot/){
+        return("Google.com/bot.html bot");
+     } elsif ($realIP =~ /173.244.186./ || $realIP =~ /173.244.180./ || $realIP =~ /207.182.153.194/ || $realIP =~ /173.45.90.146/ || $realIP =~ /182.72.168.130/ || $realIP =~ /209.190.12.130/ || $realIP =~ /173.45.123.226/ || $realIP =~ /173.45.64.34/ || $realIP =~ /64.79.68.178/){
+        return "blacklisted";
+     }
+}
+
+sub print_usage{
+  print STDERR "Usage: logparse.pl <logfile> [awk|filter] parameters\n";
+  print STDERR "Possible parameters:\n";
+  print STDERR "\t--UTC (convert timestamps to GMT/UTC time. Also accepts --EST, --PST, --CST)\n";
+  print STDERR "\t--datestamp\n";
+  print STDERR "\t--hour, --day (portions of the datestamp)\n";
+  print STDERR "\t--offset (timezone offset of the datestamp)\n";
+  print STDERR "\t--case (enable case sensitivity)\n";
+  print STDERR "\t--referrer (full referrer URL)\n";
+  print STDERR "\t--referrer_host (just the hostname of the referring URL)\n";
+  print STDERR "\t--browser_name\n";
+  print STDERR "\t--ip\n";
+  print STDERR "\t--origin (marks IPs originating within Amazon AWS or Spongecell)\n";
+  print STDERR "\t\n";
+}

@@ -1,0 +1,321 @@
+#!/usr/bin/perl
+# ( grep { $_ eq $val} @array )
+use strict;
+use warnings;
+use Time::Local; #'timelocal_nocheck';
+use HTTP::BrowserDetect;
+use URI::Escape;
+use JSON;
+use Cwd 'abs_path';
+use File::Spec;
+
+my @cl_args;
+my $method;
+
+my $useBrowser = 0;
+my $findOrigin=0;
+my $findRealReferrer=0;
+my $findShitlist=0;
+my $useDate=0;
+my $offset = 0;
+my $useIP = 0;
+my $checkBot = 0;
+
+#This is how each logline line will be split up.
+my $reg = qr/\/placements\/(\d+)\?(.*)$/;
+my $browserDetector = new HTTP::BrowserDetect("null");
+my %iphash = construct_iplist_hash();
+open FIN, "< $ARGV[0]" or die  "Input file $ARGV[0] not found\n";
+
+### We'll need to convert monthnames to monthnumbers pretty frequently via a search of the
+### @monthlist parameters. To speed this up,
+### we adjust the monthname array so that the most recent months are in the first few
+### indices.
+
+#We're going to scan through the arguments twice. The first time we'll look
+#for parameters whose presence justifies us setting global variables:
+foreach(@ARGV[1..scalar(@ARGV)-1]){
+  my $arg = $_;
+  if ($arg =~ /-+browser/){
+    $useBrowser=1;
+  } elsif ($arg =~ /-+origin=/){
+    $findOrigin=1;
+    $useIP=1;
+    $useBrowser=1;
+  } elsif ($arg =~ /-+realreferrer=/){
+    $findRealReferrer=1;
+  } elsif ($arg =~ /-+offset=(-?[0-9]+)/){
+    $offset = $1;
+  } elsif ($arg =~ /-+(offset|day|min|sec|hour|datestamp|timestamp|mday|mon|year)/){
+    $useDate=1;
+  } elsif ($arg =~ /-+(real)?ip/){
+    $useIP=1;
+  } elsif ($arg =~ /-+isbot/){
+    $useIP=1;
+    $checkBot=1;
+  } else {
+  }
+}
+
+##The second time through, we'll store anything that looks like a --key=value pair.
+my ($p1,$p2);
+foreach(@ARGV[1..scalar(@ARGV)-1]){
+  ($p1,$p2) = $_ =~ /^--(.+)=(.+)$/;
+  $p2 || next;
+  $p1 = lc($p1);
+  $p2 = lc($p2);
+  if ($p2){
+    push(@cl_args,[$p1,[split(/,/,$p2)]]);
+  }
+}
+
+while(<FIN>){
+
+#JSON structure:
+#headers
+#   Cookie
+#   Sponge-IID-Count
+#   Sponge-IID-Click-Count
+#   Referer (sic)
+#   X-Forwarded-For (the first IP in the array is the *real* ip address!)
+#   User-Agent
+#ip_address (useless)
+#tsm (timestamp in gmt -- epoch format, milliseconds)
+#uri (tags)
+
+  my $log = decode_json($_);
+  my %log = %{$log};
+
+  $log{'uri'} eq "/placements/LBHEALTHCHECK" && next;
+  $log{'uri'} eq "/" && next;
+  #split the line up according the regular expression set outside of this loop.
+
+  ##We take each parameter of the url in $tag and store them as --key=value pairs
+
+  ($log{'placement'},$log{'tags'}) = $log{'uri'} =~ /$reg/;
+  my @tags = split(/&/,$log{'tags'});
+  while(@tags){
+    my ($a,$b) = split(/=/,shift(@tags));
+    $b = $b || "null";
+    $a = lc(uri_unescape($a));
+    #IID is the only parameter for which we care about case sensitivity
+    if ($a eq "iid"){
+      $b = uri_unescape($b);
+    } else {
+      $b = lc(uri_unescape($b));
+    }
+    $log{$a}=$b;
+  }  
+
+  if($useDate){
+      my $tsm = $log{'tsm'}+(1000*3600*$offset);
+      ($log{'sec'},$log{'min'},$log{'hour'},$log{'day'},$log{'mon'},$log{'year'}) = (gmtime(substr($tsm,0,10)))[0,1,2,3,4,5];
+      $log{'year'} += 1900;
+      $log{'hour'} = "0" x ( 2 - length( $log{'hour'} ) ) .  $log{'hour'};
+      $log{'min'} = "0" x ( 2 - length( $log{'min'} ) ) .  $log{'min'};
+      $log{'sec'} = "0" x ( 2 - length( $log{'sec'} ) ) .  $log{'sec'};
+      $log{'day'} = $log{'day'} < 10 ? ("0".$log{'day'}) : ($log{'day'});
+      $log{'mon'} = $log{'mon'} < 10 ? ("0".($log{'mon'} + 1)) : ($log{'mon'});
+      $log{'datestamp'} = "".$log{'year'}."-".$log{'mon'}."-".$log{'day'};
+      $log{'timestamp'} = "".$log{'hour'}.":".$log{'min'}.":".$log{'sec'}.".".substr($tsm,10,3);
+      $log{'offset'} = $offset;
+  }
+
+  $log{'referrer'} = $log{'headers'}->{'referer'} || $log{'headers'}->{'Referer'} || "";
+  if($log{'referrer'} =~ /(http:\/\/?[^\/]+\/)/){
+    $log{'referrer_host'} = $1;
+  }
+  if($findRealReferrer){
+    $log{'realreferrer'}=find_real_referrer($log{'referrer'},1);
+  }
+
+  if($useBrowser){
+      $log{'browser'} = $log{'headers'}->{'User-Agent'} || "";
+      $browserDetector->user_agent($log{'browser'});
+      $log{'browser_name'} = ($browserDetector->browser_string() || "other")." ".($browserDetector->device_name() || "");
+      $log{'browser_ver'} = ($browserDetector->version() || "other");
+      $log{'browser_os'} = ($browserDetector->os_string() || "other");
+  }
+  #The location of the IP address is.. complicated. The "ip_address" element only indicates the
+  #IP of the Chimp server that handled the request. The "X-Forwarded-For" value in the header can have
+  #multiple values; the first value is the user's true IP. Unless it's a default click, though, in which
+  #case the real ip is in the external_ip_address parameter of the uri.
+  if($useIP){
+      ($log{'ip'}) = $log{'headers'}->{'X-Forwarded-For'} =~ /^,? ?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/;
+      $log{'ip'} = $log{'ip'} || "256.0.0.0";
+      $log{'realip'} = ($log{'external_ip_address'} || $log{'ip'});
+      ($log{'realip3'}) = $log{'realip'} =~ /(.*)\.[0-9]+$/;
+      ($log{'realip2'}) = $log{'realip'} =~ /(.*)\.[0-9]+\.[0-9]+$/;
+  }  
+  	
+  ##Browser detection, origin finding, and blacklist checking are expensive so we skip them unless we really need them.
+
+  if($findOrigin){
+     $log{'origin'} = find_origin(\%log);
+  }
+
+  if($checkBot){
+    if($iphash{$log{'realip'}}){
+      $log{'isbot'} = "true";
+    }
+  }
+
+
+  ($log{'cookie'}) = ($log{'headers'}->{'Cookie'} || $log{'headers'}->{'cookie'});
+  $log{'impression-count'} = ($log{'headers'}->{'Sponge-IID-Impression-Count'} || "");
+  $log{'click-count'} = $log{'headers'}->{'Sponge-IID-Click-Count'};
+  $log{'sponge-iid'} = $log{'headers'}->{'Sponge-IID'};
+
+
+  #We only want our report to include log events that match at least one of the parameters
+  #we've specified in our command line arguments. So we call the "isExcluded" method.
+     
+  if (!isExcluded(\%log,\@cl_args)){
+    print $log{$cl_args[0][0]} || "";
+    foreach my $arg (@cl_args[1..scalar(@cl_args)-1]){
+       print "\t".($log{${$arg}[0]} || "");
+    }
+    print "\n";
+  }
+} #end while<FIN> loop 
+
+
+## This method is going to be called once per line. It compares the command-line arguments
+## stored in cl_args to the data gleaned from the log to see if the line should be
+## filtered out.
+sub isExcluded{
+   my $log = shift;
+   my $cl_args = shift;
+
+  #if the spongetag is missing a parameter that is specified in cl_args,
+  #then the "filter" method will exclude that line while the "awk" method
+  #will treat the lines as if it has the parameter set to "".
+   foreach my $arg (@{$cl_args}){
+     if (!exists($log -> {${$arg}[0]})){
+       return 1 if !(${$arg}[1][0] eq "*");
+     }
+     return 1 if !((${$arg}[1][0] eq "*") || ( grep { $_ eq ${$log}{${$arg}[0]}} @{${$arg}[1]} ));
+    }
+  return 0;
+}
+
+sub urldecode {
+    my $s = shift;
+    $s =~ s/\%([A-Fa-f0-9]{2})/pack('C', hex($1))/seg;
+    $s =~ s/\+/ /g;
+    return $s;
+}
+
+
+sub find_real_referrer{
+  my $referrer = uri_unescape(shift);
+  my $depth = shift;
+  if ($depth > 12){
+    return $referrer;
+  }
+  if($referrer =~ /^http:\/\/tag.admeld.com\/imp.*?url=([^&]+)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif($referrer =~ /^http:\/\/afe2?.specificclick.net\/serve.*;(u|r)=(.*)/){
+    return find_real_referrer(uri_unescape($2),$depth + 1);
+  } elsif($referrer =~ /^http:\/\/x2?.vindicosuite.com\/serve.*;(u|pasmc|r)=(.*)/){
+    return find_real_referrer(uri_unescape($2),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/[^\/]+adnxs.com\/.*refer?rer=([^&]+)(&|$)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/a.rfihub.com\/sed.*&(rs|pf|pe)=([^&]+)&/){
+    return find_real_referrer(uri_unescape($2),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/apr.lijit.com\/.*&od=([^&]+)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ad.*.doubleclick.net\/.*;click0?=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ad.*.doubleclick.net\/.*;dc_ref=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ad.*.doubleclick.net\/.*\/adi\/([^\/]+)\//){
+    return "doubleclick eid:".$1;   
+  } elsif ($referrer =~ /^http:\/\/bh.contextweb.com\/bh\/ct\?q=[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~[^~]+~([^~]+)~/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ad.yieldmanager.com\/.*,,(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/googleads.g.doubleclick.net\/.*&(url|loc)=(.*)/){
+    return find_real_referrer(uri_unescape($2),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ads.undertone.com\/.*&td_s=([^&]*)&/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/ads.undertone.com\/.*oadest=(.*)\..*/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  } elsif ($referrer =~ /^http:\/\/eu2.projectsunblock.com\/.*r=(.*)/){
+    return find_real_referrer(uri_unescape($1),$depth + 1);
+  }
+
+  if($referrer =~ /(?:http:\/\/)?(?:www\.)?([^\/]+)\/?/){
+    return $1;
+  } else {
+    return $referrer;
+  }
+}
+
+sub find_origin{
+    my $hashref=shift;
+    my %log = %{$hashref};
+
+     if($log{'realip'} =~ /173.247.207.3/){ #other candidates: 72.43.111.90,
+        return("Test page (Sponge SF by IP)");
+     } elsif (($log{'realip'} =~ /^72.43./) && ($log{'referrer'} =~ /^http:\/\/cdn.statics.live.spongecell.com/)){
+        return("Test page (Sponge NY by IP)");
+     } elsif (($log{'external_placement_id'} || "") eq "testing"){
+        return("Test page (Sponge by epid)");
+     } elsif ($log{'referrer'} =~ /^http:\/\/exchange.pulsepoint.com/){
+        return("Test page (Pulsepoint)");
+     } elsif($log{'browser'} =~ /^Mozilla\/4.0$/){
+        return("blacklisted");
+     } elsif($log{'browser'} =~ /360Spider/){
+        return("China: 360Spider");
+     } elsif($log{'realip'} =~ /^157.55/ || $log{'realip'} =~ /^157.56/ || $log{'realip'} =~ /^65.55/){
+        return("MSN Bot");
+     } elsif($log{'browser'} =~ /baidu.com/){
+        return("Baidu bot");
+     } elsif($log{'browser'} =~ /^Apache-HttpClient/){
+        return("Apache-HttpClient bot");
+     } elsif($log{'realip'} =~ /^217.69.134.79/){
+        return("Mail.RU bot");
+     } elsif($log{'browser'} =~ /www.majestic12.co.uk/){
+        return("http://www.majestic12.co.uk/bot.php");
+     } elsif($log{'realip'} =~ /^66.249.76/){
+        return("Google Crawler");
+     } elsif($log{'browser'} =~ /Google Web Preview/){
+        return("Google Web Preview");
+     } elsif ($log{'realip'} =~ /173.244.186./ || $log{'realip'} =~ /173.244.180./ || $log{'realip'} =~ /207.182.153.194/ || $log{'realip'} =~ /173.45.90.146/ || $log{'realip'} =~ /182.72.168.130/ || $log{'realip'} =~ /209.190.12.130/ || $log{'realip'} =~ /173.45.123.226/ || $log{'realip'} =~ /173.45.64.34/ || $log{'realip'} =~ /64.79.68.178/){
+        return("blacklisted"); #Apache-HttpClient bot under a new name!;
+     } elsif ($log{'browser'}=~/Ezooms/){
+        return("Ezooms bot");
+     } elsif ($log{'browser'}=~/Googlebot/){
+        return("Google.com/bot.html bot");
+     } else {
+        return("");
+     }
+}
+
+sub construct_iplist_hash{
+  my %retval;
+  open FIN2, abs_path(File::Spec->catfile("iplist.txt")) or die $!;
+  while(<FIN2>){
+    chomp;
+    $retval{$_} = '1';
+  }
+  close FIN2;
+  return %retval;
+}
+
+sub print_usage{
+  print STDERR "Usage: logparse.pl <logfile> [awk|filter] parameters\n";
+  print STDERR "Possible parameters:\n";
+  print STDERR "\t--UTC (convert timestamps to GMT/UTC time. Also accepts --EST, --PST, --CST)\n";
+  print STDERR "\t--datestamp\n";
+  print STDERR "\t--hour, --day (portions of the datestamp)\n";
+  print STDERR "\t--offset <hours> (accepts 3,-7,etc)\n";
+  print STDERR "\t--case (enable case sensitivity)\n";
+  print STDERR "\t--referrer (full referrer URL)\n";
+  print STDERR "\t--referrer_host (just the hostname of the referring URL)\n";
+  print STDERR "\t--browser_name\n";
+  print STDERR "\t--ip\n";
+  print STDERR "\t--origin (marks blacklisted IPs, internal test clicks, etc)\n";
+  print STDERR "\t\n";
+}
