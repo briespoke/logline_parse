@@ -1,6 +1,8 @@
 #!/usr/bin/ruby
 
 require 'rubygems'
+require 'date'
+require 'active_support/all'
 require 'uri'
 require 'cgi'
 require 'json'
@@ -38,6 +40,18 @@ module CountVonCount
 
           request['query'] = query
 
+          time = DateTime.strptime(request['timestamp'], "%d/%b/%Y:%H:%M:%S %z").new_offset(0)
+
+          if @options[:hours]
+            time = time.change(sec: 0).change(min: 0)
+          end
+
+          if @options[:days]
+            time = time.change(sec: 0).change(min: 0).change(hour: 0)
+          end
+
+          request['timestamp'] = time 
+
           hash = @format.reduce({}) do |hash, spec|
             source = spec.split('.').reduce(request) do |hash, key|
               hash[key] || ''
@@ -58,8 +72,10 @@ module CountVonCount
       
       totals.values.each do |row|
         row[:hash].each do |spec, value|
+          string_val = value.class == String ? value : value.to_s
           widths[spec] ||= 0
-          widths[spec] = [widths[spec], spec.size, value.size].max
+
+          widths[spec] = [widths[spec], spec.size, string_val.size].max
         end
       end
 
@@ -83,7 +99,6 @@ module CountVonCount
 end
 
 p = Trollop::Parser.new do
-  opt :quiet, "Use minimal output", :short => 'q'
   banner <<-EOS
 count counts logline elements.
 
@@ -92,16 +107,29 @@ Usage:
 
 If no filename is specified, it will read from STDIN.
 
-pathspec:
+Pathspec:
+      ip_address, timestamp, uri, status, referrer, user_agent, query.[query parameter]
 
-A JSON array of strings, each specifying a path. Such as:
+A JSON array of strings, each specifying a path. The paths can either be one of the single values above, or a query parameter specified like this:
 
-      ruby count.rb '["uri", "referrer", "query.type"]'
+      ruby count.rb '["referrer", "query.type"]' status.log
+
+produces the following output:
+                                       referrer query.type count
+                                              - IMPRESSION 4
+                                              -            10
+      http://localhost:3000/ad_tags/926000/test            5
+      http://localhost:3000/ad_tags/926000/test      start 3
+      http://localhost:3000/ad_tags/926000/test   complete 1
+
 
 count will group based on the fields specified.
 
-options:
+Options:
 EOS
+  opt :quiet, "Use minimal output", short: 'q'
+  opt :hours, "Bucket time by hours", short: 'H'
+  opt :days, "Bucket time by days", short: 'd'
 end
 
 opts = Trollop::with_standard_exception_handling p do

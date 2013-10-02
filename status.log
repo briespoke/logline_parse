@@ -17,8 +17,7 @@
 173.247.207.38 - - [01/Oct/2013:20:28:51 +0000] "GET /placements/Placement8?metric=initialized& HTTP/1.1" 304 0 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
 173.247.207.38 - - [01/Oct/2013:20:29:18 +0000] "GET /placements/Placement8?metric=initialized& HTTP/1.1" 304 0 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
 173.247.207.38 - - [01/Oct/2013:20:31:19 +0000] "GET /placements/Placement8?metric=initialized& HTTP/1.1" 304 0 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
-
-173.247.207.38 - - [01/Oct/2013:20:31:19 +0000] "GET /placements/JunkPlacement?type=start&desc=grid_loads&duration=345&flight_id=1&creative_id=2&sp_id=3&ad_tag_id=4 HTTP/1.1" 304 0 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
-
-
-
+173.247.207.38 - - [01/Oct/2013:23:21:43 +0000] "GET /placements/Placement8?type=start&description=tag_init HTTP/1.1" 200 43 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
+173.247.207.38 - - [01/Oct/2013:23:22:54 +0000] "GET /placements/Placement8?type=start&description=tag_init HTTP/1.1" 304 0 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
+173.247.207.38 - - [01/Oct/2013:23:27:19 +0000] "GET /placements/Placement8?type=complete&description=tag_init&duration=6 HTTP/1.1" 200 43 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
+173.247.207.38 - - [01/Oct/2013:23:27:19 +0000] "GET /placements/Placement8?type=start&description=tag_init HTTP/1.1" 304 0 "http://localhost:3000/ad_tags/926000/test" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:24.0) Gecko/20100101 Firefox/24.0"
