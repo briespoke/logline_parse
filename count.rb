@@ -18,6 +18,10 @@ module CountVonCount
     def log_line_regex
       /(?<ip_address>[0-9\.]+) - - \[(?<timestamp>.+?)\] "(?<uri>.+?)" (?<status>[0-9]+) [0-9]+ "(?<referrer>.+?)" "(?<user_agent>.+?)"/
     end
+
+    def placement_regex
+      /\/placements\/(?<placement_id>[0-9]+)/
+    end
     
     def process(input)
       totals = {}
@@ -27,6 +31,11 @@ module CountVonCount
           request = matches.names.reduce({}) {|result, name| result[name] = matches[name]; result}
           
           uri = URI::parse matches[:uri].split(' ')[1]
+
+          placement_regex.match(uri.path) do |placement_matches|
+            request['placement_id'] = placement_matches[:placement_id]
+          end
+          
           query = if uri.query
             uri.query.split('&').reduce({}) do |result, str|
               key, value = str.split '='
