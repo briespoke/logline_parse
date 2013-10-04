@@ -6,6 +6,7 @@ require 'active_support/all'
 require 'uri'
 require 'cgi'
 require 'json'
+require 'csv'
 require 'trollop'
 
 module CountVonCount
@@ -76,10 +77,32 @@ module CountVonCount
         end
       end
 
+      @totals = totals
+    end
+
+    def to_csv
+      csv_string = CSV.generate do |csv|
+        csv << @format + ["count"]
+
+        @totals.values.each do |record|
+          row = []
+          record[:hash].each do |spec, value|
+            row << value
+          end
+          row << record[:total]
+
+          csv << row
+        end
+      end
+      csv_string
+    end
+
+    def to_table
+      output = ""
       table = []
       widths = {}
       
-      totals.values.each do |row|
+      @totals.values.each do |row|
         row[:hash].each do |spec, value|
           string_val = value.class == String ? value : value.to_s
           widths[spec] ||= 0
@@ -91,18 +114,18 @@ module CountVonCount
       unless @options[:quiet]
         @format.each do |spec|
           size = [widths[spec], spec.size].max
-          printf("%#{size}s ", spec)
+          output << sprintf("%#{size}s ", spec)
         end
-        puts "count"
+        output << "count\n"
       end
 
-      totals.values.each do |row|
+      @totals.values.each do |row|
         row[:hash].each do |spec, value|
-          printf("%#{widths[spec]}s ", value)
+          output << sprintf("%#{widths[spec]}s ", value)
         end
-        puts row[:total]
+        output << "#{row[:total]}\n"
       end
-
+      output
     end
   end
 end
@@ -137,6 +160,7 @@ count will group based on the fields specified.
 Options:
 EOS
   opt :quiet, "Use minimal output", short: 'q'
+  opt :csv, "Output csv", short: 'c'
   opt :hours, "Bucket time by hours", short: 'H'
   opt :days, "Bucket time by days", short: 'd'
 end
@@ -151,3 +175,9 @@ input = ARGV[1] ? open(ARGV[1]) : STDIN
 
 parser = CountVonCount::LogParser.new(spec, opts)
 parser.process(input)
+
+if opts[:csv]
+  puts parser.to_csv
+else
+  puts parser.to_table
+end
