@@ -10,9 +10,30 @@ require 'csv'
 require 'trollop'
 
 module CountVonCount
+  class MeanAggregator < Array
+    def to_s
+      unless @aggregate && @aggregate_size == size
+        sum = reduce(:+)
+        @aggregate = sum.to_f / size.to_f
+        @aggregate_size = size
+      end
+      @aggregate.round(2).to_s
+    end
+  end
+
   class LogParser
     def initialize(format_string, options)
-      @format = JSON.parse(format_string)
+      @format_fields_in_order = []
+      @aggregates = {}
+      @format = format_string.split(',').reduce({}) do |result, token|
+        field, flags = token.split('=').map {|t| t.strip}
+        result[field] = flags
+        unless flags.nil?
+          @aggregates[field] = flags
+        end
+        @format_fields_in_order << field
+        result
+      end
       @options = options
     end
 
@@ -62,18 +83,29 @@ module CountVonCount
 
           request['timestamp'] = time 
 
-          hash = @format.reduce({}) do |hash, spec|
-            source = spec.split('.').reduce(request) do |hash, key|
-              hash[key] || ''
+          hash = @format.reduce({}) do |result, (spec, options)|
+            unless options.blank?
+              result[spec] ||= nil
+            else
+	      source = spec.split('.').reduce(request) do |request_obj, key|
+	        request_obj[key] || ''
+	      end
+	      result[spec] ||= source
             end
-            hash[spec] ||= source
-
-            hash
+  
+    	    result
           end
           hash_key = Marshal::dump(hash)
 
           totals[hash_key] ||= {hash: hash, total: 0}
           totals[hash_key][:total] += 1
+          @aggregates.each do |spec, type|
+	    source = spec.split('.').reduce(request) do |request_obj, key|
+	      request_obj[key] || ''
+	    end
+            totals[hash_key][:hash][spec] ||= MeanAggregator.new
+            totals[hash_key][:hash][spec] << source.to_i
+          end
         end
       end
 
@@ -82,7 +114,7 @@ module CountVonCount
 
     def to_csv
       csv_string = CSV.generate do |csv|
-        csv << @format + ["count"]
+        csv << @format_fields_in_order + ["count"]
 
         @totals.values.each do |record|
           row = []
@@ -104,6 +136,7 @@ module CountVonCount
       
       @totals.values.each do |row|
         row[:hash].each do |spec, value|
+          $stderr.puts value.class
           string_val = value.class == String ? value : value.to_s
           widths[spec] ||= 0
 
@@ -112,7 +145,7 @@ module CountVonCount
       end
 
       unless @options[:quiet]
-        @format.each do |spec|
+        @format_fields_in_order.each do |spec|
           size = [widths[spec], spec.size].max
           output << sprintf("%#{size}s ", spec)
         end
