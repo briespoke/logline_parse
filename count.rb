@@ -11,28 +11,11 @@ require 'trollop'
 require 'useragent'
 
 module CountVonCount
-  class MeanAggregator < Array
-    def to_s
-      unless @aggregate && @aggregate_size == size
-        sum = reduce(:+)
-        @aggregate = sum.to_f / size.to_f
-        @aggregate_size = size
-      end
-      @aggregate.round(2).to_s
-    end
-  end
 
   class LogParser
     def initialize(format_string, options)
-      @format_fields_in_order = []
-      @aggregates = {}
-      @format = format_string.split(',').reduce({}) do |result, token|
-        field, flags = token.split('=').map {|t| t.strip}
-        result[field] = flags
-        unless flags.nil?
-          @aggregates[field] = flags
-        end
-        @format_fields_in_order << field
+      @format = format_string.split(',').reduce([]) do |result, token|
+        result << token.strip
         result
       end
       @options = options
@@ -49,111 +32,120 @@ module CountVonCount
     def placement_regex
       /\/placements\/(?<placement_id>[0-9]+)/
     end
+
+    def line_matches_to_hash(line, matches)
+      request = matches.names.reduce({}) {|result, name| result[name] = matches[name]; result}
+      
+      uri = URI::parse matches[:uri].split(' ')[1]
+
+      placement_regex.match(uri.path) do |placement_matches|
+        request['placement_id'] = placement_matches[:placement_id]
+      end
+      
+      query = if uri.query
+        uri.query.split('&').reduce({}) do |result, str|
+          key, value = str.split '='
+          result[key] = value
+          result
+        end
+      else 
+        {} 
+      end
+
+      request['uri'] = uri.to_s
+      request['query'] = query
+      agent = UserAgent.parse(request['user_agent'])
+      
+      request['browser'] = agent.browser
+      request['platform'] = agent.platform
+
+
+      time = DateTime.strptime(request['timestamp'], "%d/%b/%Y:%H:%M:%S %z").new_offset(0)
+
+      if @options[:hours]
+        time = time.change(sec: 0).change(min: 0)
+      end
+
+      if @options[:days]
+        time = time.change(sec: 0).change(min: 0).change(hour: 0)
+      end
+
+      request['timestamp'] = time 
+
+      hash = @format.reduce({}) do |result, spec|
+        source = spec.split('.').reduce(request) do |request_obj, key|
+          request_obj[key] || ''
+        end
+        result[spec] ||= source
+
+        result
+      end
+      {hash: hash}
+    end
     
-    def process(input)
+    def process_flat(input)
+      input.readlines.each do |line|
+        log_line_regex.match(line) do |matches|
+          hash = line_matches_to_hash(line, matches)
+
+          yield hash
+        end
+      end
+
+    end
+
+    def process_with_counts(input)
       totals = {}
 
       input.readlines.each do |line|
         log_line_regex.match(line) do |matches|
-          request = matches.names.reduce({}) {|result, name| result[name] = matches[name]; result}
-          if @options[:extra]
-            optional_regex.match(line) do |optional_matches|
-              optional_matches.names.each do |name|
-                request[name] = optional_matches[name]
-              end
-            end
-          end
-
-          uri = URI::parse matches[:uri].split(' ')[1]
-
-          placement_regex.match(uri.path) do |placement_matches|
-            request['placement_id'] = placement_matches[:placement_id]
-          end
-          
-          query = if uri.query
-            uri.query.split('&').reduce({}) do |result, str|
-              key, value = str.split '='
-              result[key] = value
-              result
-            end
-          else 
-            {} 
-          end
-
-          agent = UserAgent.parse(request['user_agent'])
-          
-          request['browser'] = agent.browser
-          request['platform'] = agent.platform
-
-          request['uri'] = uri.to_s
-
-          request['query'] = query
-
-          time = DateTime.strptime(request['timestamp'], "%d/%b/%Y:%H:%M:%S %z").new_offset(0)
-
-          if @options[:hours]
-            time = time.change(sec: 0).change(min: 0)
-          end
-
-          if @options[:days]
-            time = time.change(sec: 0).change(min: 0).change(hour: 0)
-          end
-
-          request['timestamp'] = time 
-
-          hash = @format.reduce({}) do |result, (spec, options)|
-            unless options.blank?
-              result[spec] ||= nil
-            else
-      	      source = spec.split('.').reduce(request) do |request_obj, key|
-      	        request_obj[key] || ''
-      	      end
-      	      result[spec] ||= source
-            end
-      	    result
-          end
+          hash = line_matches_to_hash(line, matches)
 
           hash_key = Marshal::dump(hash)
 
           totals[hash_key] ||= {hash: hash, total: 0}
           totals[hash_key][:total] += 1
-
-          @aggregates.each do |spec, type|
-      	    source = spec.split('.').reduce(request) do |request_obj, key|
-      	      request_obj[key] || ''
-      	    end
-            totals[hash_key][:hash][spec] ||= MeanAggregator.new
-            totals[hash_key][:hash][spec] << source.to_i
-          end
         end
       end
 
-      @totals = totals
+      totals.each do |hash_key, hash|
+        yield hash
+      end
     end
 
-    def to_csv
-      csv_string = CSV.generate do |csv|
-        csv << @format_fields_in_order + ["count"]
+    def process(input, &block)
+      if @options[:aggregate]
+        process_with_counts(input, &block)
+      else
+        process_flat(input, &block)
+      end
+    end
 
-        @totals.values.each do |record|
-          row = []
-          record[:hash].each do |spec, value|
-            row << value
-          end
+    def to_csv(input)
+      headers = @format
+
+      if @options[:aggregate]
+        headers << 'count'
+      end
+      
+      puts headers.to_csv
+
+      process(input) do |record|
+        row = record[:hash].values
+
+        if @options[:aggregate]
           row << record[:total]
-
-          csv << row
         end
+        puts row.to_csv
       end
-      csv_string
     end
 
-    def to_table
+    def to_table(input)
       output = ""
       table = []
       widths = {}
       
-      @totals.values.each do |row|
+      process(input) do |row|
         row[:hash].each do |spec, value|
           string_val = value.class == String ? value : value.to_s
           widths[spec] ||= 0
@@ -163,7 +155,7 @@ module CountVonCount
       end
 
       unless @options[:quiet]
-        @format_fields_in_order.each do |spec|
+        @format.each do |spec|
           size = [widths[spec], spec.size].max
           output << sprintf("%#{size}s ", spec)
         end
@@ -213,6 +205,7 @@ EOS
   opt :quiet, "Use minimal output", short: 'q'
   opt :csv, "Output csv", short: 'c'
   opt :extra, "Use extra data", short: 'e'
+  opt :aggregate, "Aggregate counts", short: 'a'
   opt :hours, "Bucket time by hours", short: 'H'
   opt :days, "Bucket time by days", short: 'd'
 end
@@ -226,10 +219,9 @@ spec = ARGV[0]
 input = ARGV[1] ? open(ARGV[1]) : STDIN
 
 parser = CountVonCount::LogParser.new(spec, opts)
-parser.process(input)
 
 if opts[:csv]
-  puts parser.to_csv
+  puts parser.to_csv(input)
 else
-  puts parser.to_table
+  puts parser.to_table(input)
 end
