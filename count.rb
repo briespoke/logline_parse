@@ -52,6 +52,14 @@ module CountVonCount
         {} 
       end
 
+      if @options[:extra]
+        optional_regex.match(line) do |optional_matches|
+          optional_matches.names.each do |name|
+            request[name] = optional_matches[name]
+          end
+        end
+      end
+
       request['uri'] = uri.to_s
       request['query'] = query
       agent = UserAgent.parse(request['user_agent'])
@@ -221,7 +229,7 @@ input = ARGV[1] ? open(ARGV[1]) : STDIN
 parser = CountVonCount::LogParser.new(spec, opts)
 
 if opts[:csv]
-  puts parser.to_csv(input)
+  parser.to_csv(input)
 else
-  puts parser.to_table(input)
+  parser.to_table(input)
 end
