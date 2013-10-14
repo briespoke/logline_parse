@@ -14,14 +14,13 @@ end
 
 redis = Redis.new(:host => "localhost", :port => 6378)
 
-file = open("status.oct102013.log")
 
-file.each_line do |line|
+$stdin.each_line do |line|
   log_line_regex.match(line) do |matches|
     ip = matches[:ip_address]
 
     addrInfo = redis.hgetall(ip)
     
-    puts "#{line} #{addrInfo["country"]} #{addrInfo["metroCode"]} #{addrInfo["speed"]}"
+    puts "#{line.chomp} #{addrInfo["metroCode"]} #{addrInfo["speed"]}"
   end
 end
