@@ -8,6 +8,7 @@ require 'cgi'
 require 'json'
 require 'csv'
 require 'trollop'
+require 'useragent'
 
 module CountVonCount
   class MeanAggregator < Array
@@ -41,6 +42,10 @@ module CountVonCount
       /(?<ip_address>[0-9\.]+) - - \[(?<timestamp>.+?)\] "(?<uri>.+?)" (?<status>[0-9]+) [0-9]+ "(?<referrer>.+?)" "(?<user_agent>.+?)"/
     end
 
+    def optional_regex
+      /(?<dma>\w+?) (?<speed>\w+?)$/
+    end
+
     def placement_regex
       /\/placements\/(?<placement_id>[0-9]+)/
     end
@@ -51,7 +56,14 @@ module CountVonCount
       input.readlines.each do |line|
         log_line_regex.match(line) do |matches|
           request = matches.names.reduce({}) {|result, name| result[name] = matches[name]; result}
-          
+          if @options[:extra]
+            optional_regex.match(line) do |optional_matches|
+              optional_matches.names.each do |name|
+                request[name] = optional_matches[name]
+              end
+            end
+          end
+
           uri = URI::parse matches[:uri].split(' ')[1]
 
           placement_regex.match(uri.path) do |placement_matches|
@@ -67,6 +79,12 @@ module CountVonCount
           else 
             {} 
           end
+
+          agent = UserAgent.parse(request['user_agent'])
+          
+          request['browser'] = agent.browser
+          request['platform'] = agent.platform
+
           request['uri'] = uri.to_s
 
           request['query'] = query
@@ -87,22 +105,23 @@ module CountVonCount
             unless options.blank?
               result[spec] ||= nil
             else
-	      source = spec.split('.').reduce(request) do |request_obj, key|
-	        request_obj[key] || ''
-	      end
-	      result[spec] ||= source
+      	      source = spec.split('.').reduce(request) do |request_obj, key|
+      	        request_obj[key] || ''
+      	      end
+      	      result[spec] ||= source
             end
-  
-    	    result
+      	    result
           end
+
           hash_key = Marshal::dump(hash)
 
           totals[hash_key] ||= {hash: hash, total: 0}
           totals[hash_key][:total] += 1
+
           @aggregates.each do |spec, type|
-	    source = spec.split('.').reduce(request) do |request_obj, key|
-	      request_obj[key] || ''
-	    end
+      	    source = spec.split('.').reduce(request) do |request_obj, key|
+      	      request_obj[key] || ''
+      	    end
             totals[hash_key][:hash][spec] ||= MeanAggregator.new
             totals[hash_key][:hash][spec] << source.to_i
           end
@@ -136,7 +155,6 @@ module CountVonCount
       
       @totals.values.each do |row|
         row[:hash].each do |spec, value|
-          $stderr.puts value.class
           string_val = value.class == String ? value : value.to_s
           widths[spec] ||= 0
 
@@ -194,6 +212,7 @@ Options:
 EOS
   opt :quiet, "Use minimal output", short: 'q'
   opt :csv, "Output csv", short: 'c'
+  opt :extra, "Use extra data", short: 'e'
   opt :hours, "Bucket time by hours", short: 'H'
   opt :days, "Bucket time by days", short: 'd'
 end
